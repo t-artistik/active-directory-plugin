@@ -285,15 +285,9 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
             // locate this user's record
             final String domainDN = toDC(domainName);
 
-            Attributes user = new LDAPSearchBuilder(context,domainDN).subTreeScope().searchOne("(& (userPrincipalName={0})(objectCategory=user))",userPrincipalName);
+            Attributes user = new LDAPSearchBuilder(context,domainDN).subTreeScope().searchOne("(& (sAMAccountName={0})(objectCategory=user))",samAccountName);
             if (user==null) {
-                // failed to find it. Fall back to sAMAccountName.
-                // see http://www.nabble.com/Re%3A-Hudson-AD-plug-in-td21428668.html
-                LOGGER.fine("Failed to find "+userPrincipalName+" in userPrincipalName. Trying sAMAccountName");
-                user = new LDAPSearchBuilder(context,domainDN).subTreeScope().searchOne("(& (sAMAccountName={0})(objectCategory=user))",samAccountName);
-                if (user==null) {
-                    throw new UsernameNotFoundException("Authentication was successful but cannot locate the user information for "+username);
-                }
+                throw new UsernameNotFoundException("Authentication was successful but cannot locate the user information for "+username);
             }
             LOGGER.fine("Found user "+username+" : "+user);
 
@@ -424,37 +418,7 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
         parseMembers(userDN, groups, renum);
         renum.close();
 
-        {/*
-            stage 2: use memberOf to find groups that aren't picked up by tokenGroups.
-            This includes distribution groups
-        */
-            LOGGER.fine("Stage 2: looking up via memberOf");
-
-            while (true) {
-                switch (groupLookupStrategy) {
-                case AUTO:
-                    // try the accurate one first, and if it's too slow fall back to recursive in the hope that it's faster
-                    long start = System.currentTimeMillis();
-                    boolean found = chainGroupLookup(domainDN, userDN, context, groups);
-                    long duration = (System.currentTimeMillis() - start) / TimeUnit2.SECONDS.toMillis(1);
-                    if (!found || duration >= 10) {
-                        LOGGER.warning(String.format("AD chain lookup is taking too long (%dms). Falling back to recursive lookup", duration));
-                        groupLookupStrategy = GroupLookupStrategy.RECURSIVE;
-                        continue;
-                    } else {
-                        // it run fast enough, so let's stick to it
-                        groupLookupStrategy = GroupLookupStrategy.CHAIN;
-                        return groups;
-                    }
-                case RECURSIVE:
-                    recursiveGroupLookup(context, id, groups);
-                    return groups;
-                case CHAIN:
-                    chainGroupLookup(domainDN, userDN, context, groups);
-                    return groups;
-                }
-            }
-        }
+        return groups;
     }
 
     /**
