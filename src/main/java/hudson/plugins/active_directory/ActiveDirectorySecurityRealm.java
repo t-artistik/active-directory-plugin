@@ -1,8 +1,29 @@
+/*
+ * The MIT License
+ *
+ * Copyright (c) 2008-2014, Kohsuke Kawaguchi, CloudBees, Inc., and contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 package hudson.plugins.active_directory;
 
-import static hudson.Util.fixEmpty;
-import static hudson.plugins.active_directory.ActiveDirectoryUnixAuthenticationProvider.toDC;
-
+import com.sun.jndi.ldap.LdapCtxFactory;
 import com4j.typelibs.ado20.ClassFactory;
 import groovy.lang.Binding;
 import hudson.Extension;
@@ -11,39 +32,14 @@ import hudson.Util;
 import hudson.model.Descriptor;
 import hudson.model.Hudson;
 import hudson.security.AbstractPasswordBasedSecurityRealm;
+import hudson.security.AuthorizationStrategy;
 import hudson.security.GroupDetails;
 import hudson.security.SecurityRealm;
 import hudson.security.TokenBasedRememberMeServices2;
 import hudson.util.FormValidation;
+import hudson.util.ListBoxModel;
 import hudson.util.Secret;
 import hudson.util.spring.BeanBuilder;
-
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.StringWriter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Hashtable;
-import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
-import javax.naming.Context;
-import javax.naming.NamingEnumeration;
-import javax.naming.NamingException;
-import javax.naming.directory.Attribute;
-import javax.naming.directory.Attributes;
-import javax.naming.directory.DirContext;
-import javax.naming.directory.InitialDirContext;
-import javax.naming.ldap.LdapContext;
-import javax.naming.ldap.StartTlsRequest;
-import javax.naming.ldap.StartTlsResponse;
-import javax.net.ssl.SSLSocketFactory;
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-
 import org.acegisecurity.Authentication;
 import org.acegisecurity.AuthenticationException;
 import org.acegisecurity.AuthenticationManager;
@@ -59,7 +55,33 @@ import org.kohsuke.stapler.StaplerResponse;
 import org.springframework.dao.DataAccessException;
 import org.springframework.web.context.WebApplicationContext;
 
-import com.sun.jndi.ldap.LdapCtxFactory;
+import javax.naming.Context;
+import javax.naming.NamingEnumeration;
+import javax.naming.NamingException;
+import javax.naming.directory.Attribute;
+import javax.naming.directory.Attributes;
+import javax.naming.directory.DirContext;
+import javax.naming.directory.InitialDirContext;
+import javax.naming.ldap.LdapContext;
+import javax.naming.ldap.StartTlsRequest;
+import javax.naming.ldap.StartTlsResponse;
+import javax.net.ssl.SSLSocketFactory;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static hudson.Util.*;
+import static hudson.plugins.active_directory.ActiveDirectoryUnixAuthenticationProvider.*;
 
 /**
  * {@link SecurityRealm} that talks to Active Directory.
@@ -107,20 +129,54 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
      */
     public final String server;
 
-    @DataBoundConstructor
+    private GroupLookupStrategy groupLookupStrategy;
+
+    /**
+     * If true, Jenkins ignores Active Directory groups that are not being used by the active Authorization Strategy.
+     * This can significantly improve performance in environments with a large number of groups
+     * but a small number of corresponding rules defined by the Authorization Strategy.
+     * Groups are considered as used if they are returned by {@link AuthorizationStrategy#getGroups()}.
+     */
+    public final boolean removeIrrelevantGroups;
+
     public ActiveDirectorySecurityRealm(String domain, String site, String bindName, String bindPassword, String server) {
+        this(domain, site, bindName, bindPassword, server, GroupLookupStrategy.AUTO, false);
+    }
+
+    public ActiveDirectorySecurityRealm(String domain, String site, String bindName, String bindPassword, String server, GroupLookupStrategy groupLookupStrategy) {
+        this(domain,site,bindName,bindPassword,server,groupLookupStrategy,false);
+    }
+
+    public ActiveDirectorySecurityRealm(String domain, String site, String bindName,
+                                        String bindPassword, String server, GroupLookupStrategy groupLookupStrategy, boolean removeIrrelevantGroups) {
+        this(domain,site,bindName,bindPassword,server,groupLookupStrategy,removeIrrelevantGroups,domain!=null);
+    }
+    
+    @DataBoundConstructor
+    // as Java signature, this binding doesn't make sense, so please don't use this constructor
+    public ActiveDirectorySecurityRealm(String domain, String site, String bindName,
+                                        String bindPassword, String server, GroupLookupStrategy groupLookupStrategy, boolean removeIrrelevantGroups, Boolean customDomain) {
+        if (customDomain!=null && !customDomain)
+            domain = null;
         this.domain = fixEmpty(domain);
         this.site = fixEmpty(site);
         this.bindName = fixEmpty(bindName);
         this.bindPassword = Secret.fromString(fixEmpty(bindPassword));
+        this.groupLookupStrategy = groupLookupStrategy;
+        this.removeIrrelevantGroups = removeIrrelevantGroups;
 
         // append default port if not specified
         server = fixEmpty(server);
         if (server != null) {
             if (!server.contains(":")) server += ":3268";
         }
-        
+
         this.server = server;
+    }
+
+    public GroupLookupStrategy getGroupLookupStrategy() {
+        if (groupLookupStrategy==null)      return GroupLookupStrategy.AUTO;
+        return groupLookupStrategy;
     }
 
     public SecurityComponents createSecurityComponents() {
@@ -135,11 +191,12 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
 
         TokenBasedRememberMeServices2 rms = new TokenBasedRememberMeServices2() {
             public Authentication autoLogin(HttpServletRequest request, HttpServletResponse response) {
-                // no supporting auto-login unless we can do retrieveUser. See JENKINS-11643.
-                if (adp.canRetrieveUserByName())
+                try {
                     return super.autoLogin(request, response);
-                else
+                } catch (Exception e) {// TODO: this check is made redundant with 1.556, but needed with earlier versions
+                    cancelCookie(request, response, "Failed to handle remember-me cookie: "+Functions.printThrowable(e));
                     return null;
+                }
             }
         };
         rms.setUserDetailsService(uds);
@@ -150,8 +207,8 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
     }
 
     @Override
-    public DesciprotrImpl getDescriptor() {
-        return (DesciprotrImpl) super.getDescriptor();
+    public DescriptorImpl getDescriptor() {
+        return (DescriptorImpl) super.getDescriptor();
     }
 
     /**
@@ -170,7 +227,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
             UserDetailsService uds = getAuthenticationProvider();
             if (uds instanceof ActiveDirectoryUnixAuthenticationProvider) {
                 ActiveDirectoryUnixAuthenticationProvider p = (ActiveDirectoryUnixAuthenticationProvider) uds;
-                DesciprotrImpl descriptor = getDescriptor();
+                DescriptorImpl descriptor = getDescriptor();
 
                 for (String domainName : domain.split(",")) {
 	                try {
@@ -206,7 +263,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
     }
 
     @Extension
-    public static final class DesciprotrImpl extends Descriptor<SecurityRealm> {
+    public static final class DescriptorImpl extends Descriptor<SecurityRealm> {
         public String getDisplayName() {
             return Messages.DisplayName();
         }
@@ -236,6 +293,14 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
             }
         }
 
+        public ListBoxModel doFillGroupLookupStrategyItems() {
+            ListBoxModel model = new ListBoxModel();
+            for (GroupLookupStrategy e : GroupLookupStrategy.values()) {
+                model.add(e.getDisplayName(),e.name());
+            }
+            return model;
+        }
+
         private static boolean WARNED = false;
 
         public FormValidation doValidate(@QueryParameter(fixEmpty = true) String domain, @QueryParameter(fixEmpty = true) String site, @QueryParameter(fixEmpty = true) String bindName,
@@ -244,8 +309,20 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
             Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
             try {
                 Functions.checkPermission(Hudson.ADMINISTER);
-                String n = Util.fixEmptyAndTrim(domain);
-                if (n==null) {// no value given yet
+                domain = Util.fixEmptyAndTrim(domain);
+
+                if (canDoNativeAuth() && domain==null) {
+                    // this check must be identical to that of ActiveDirectory.groovy
+                    try {
+                        // make sure we can connect via ADSI
+                        new ActiveDirectoryAuthenticationProvider();
+                        return FormValidation.ok("OK");
+                    } catch (Exception e) {
+                        return FormValidation.error(e, "Failed to contact Active Directory");
+                    }
+                }
+
+                if (domain==null) {// no value given yet
                     return FormValidation.error("No domain name set");
                 }
 
@@ -253,7 +330,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                 if (bindName!=null && password==null)
                     return FormValidation.error("DN is specified but not password");
 
-                String[] names = n.split(",");
+                String[] names = domain.split(",");
                 for (String name : names) {
 
                     if (!name.endsWith("."))
@@ -296,7 +373,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                             DirContext context = bind(bindName, Secret.toString(password), servers);
                             try {
                                 // actually do a search to make sure the credential is valid
-                                new LDAPSearchBuilder(context, toDC(domain)).searchOne("(objectClass=user)");
+                                new LDAPSearchBuilder(context, toDC(name)).searchOne("(objectClass=user)");
                             } finally {
                                 context.close();
                             }
@@ -506,6 +583,8 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                 } catch (NamingException e) {
                     // failed retrieval. try next option.
                     failure = e;
+                } catch (NumberFormatException x) {
+                    failure = (NamingException) new NamingException("JDK IPv6 bug encountered").initCause(x);
                 }
             }
 
@@ -542,7 +621,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                         // map to LDAPS ports. I don't think there's any SRV records specifically for LDAPS.
                         // I think Microsoft considers LDAP+TLS the way to go, or else there should have been
                         // separate SRV entries.
-                        if (port==389)  port=686;
+                        if (port==389)  port=636;
                         if (port==3268) port=3269;
                     }
                     int p = Integer.parseInt(fields[0]);
@@ -559,7 +638,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                 throw x;
             }
 
-            LOGGER.fine(ldapServer+" resolved to "+result);
+            LOGGER.fine(ldapServer + " resolved to " + result);
             return result;
         }
     }
@@ -607,5 +686,5 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
      * One legitimate use case is when the domain controller is Windows 2000, which doesn't support TLS
      * (according to http://support.microsoft.com/kb/321051).
      */
-    public static boolean FORCE_LDAPS = Boolean.getBoolean(ActiveDirectoryUnixAuthenticationProvider.class.getName()+".forceLdaps");
+    public static boolean FORCE_LDAPS = Boolean.getBoolean(ActiveDirectorySecurityRealm.class.getName()+".forceLdaps");
 }

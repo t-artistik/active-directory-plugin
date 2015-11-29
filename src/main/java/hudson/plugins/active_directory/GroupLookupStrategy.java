@@ -23,40 +23,33 @@
  */
 package hudson.plugins.active_directory;
 
-import java.io.IOException;
-import java.net.Socket;
+import org.jvnet.localizer.Localizable;
 
 /**
- * Tuple of a socket endpoint. A pair of the host name and the TCP port number.
+ * Hack to let people pick lesser of two evils: performance or completeness.
+ *
+ * See JENKINS-22830 for the context.
+ *
+ * Marking as package private because I hope to get rid of this switch one day by figuring out
+ * "the right way".
+ *
+ * See help-groupLookupStrategy.html for the detailed discussion.
  *
  * @author Kohsuke Kawaguchi
  */
-public class SocketInfo {
-    public final String host;
-    public final int port;
+/*hidden*/ enum GroupLookupStrategy {
+    AUTO     (Messages._GroupLookupStrategy_Auto()),
+    RECURSIVE(Messages._GroupLookupStrategy_Recursive()),
+    CHAIN    (Messages._GroupLookupStrategy_ChainMatch()),
+    ;
 
-    public SocketInfo(String host, int port) {
-        this.host = host;
-        this.port = port;
+    public final Localizable msg;
+
+    GroupLookupStrategy(Localizable msg) {
+        this.msg = msg;
     }
 
-    public SocketInfo(String hostAndPort) {
-        int idx = hostAndPort.lastIndexOf(':');
-        if (idx<0) {
-            this.host = hostAndPort;
-            this.port = 0;
-        } else {
-            this.host = hostAndPort.substring(0,idx);
-            this.port = Integer.parseInt(hostAndPort.substring(idx+1));
-        }
-    }
-
-    @Override
-    public String toString() {
-        return port==0 ? host : host+':'+port;
-    }
-
-    public Socket connect() throws IOException {
-        return new Socket(host,port);
+    public String getDisplayName() {
+        return msg.toString();
     }
 }

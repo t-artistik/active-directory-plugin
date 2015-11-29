@@ -1,8 +1,32 @@
+/*
+ * The MIT License
+ *
+ * Copyright (c) 2008-2014, Kohsuke Kawaguchi, CloudBees, Inc., and contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 package hudson.plugins.active_directory;
 
 import com4j.COM4J;
 import com4j.Com4jObject;
 import com4j.ComException;
+import com4j.ExecutionException;
 import com4j.Variant;
 import com4j.typelibs.activeDirectory.IADs;
 import com4j.typelibs.activeDirectory.IADsGroup;
@@ -24,7 +48,9 @@ import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
 import org.acegisecurity.userdetails.UserDetails;
 import org.acegisecurity.userdetails.UserDetailsService;
 import org.acegisecurity.userdetails.UsernameNotFoundException;
+import org.kohsuke.stapler.framework.io.IOException2;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Level;
@@ -42,15 +68,35 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
      */
     private final _Connection con;
 
-    public ActiveDirectoryAuthenticationProvider() {
-        IADs rootDSE = COM4J.getObject(IADs.class, "LDAP://RootDSE", null);
+    public ActiveDirectoryAuthenticationProvider() throws IOException {
+        try {
+            IADs rootDSE = COM4J.getObject(IADs.class, "LDAP://RootDSE", null);
 
-        defaultNamingContext = (String)rootDSE.get("defaultNamingContext");
-        LOGGER.info("Active Directory domain is "+defaultNamingContext);
+            defaultNamingContext = (String)rootDSE.get("defaultNamingContext");
+            LOGGER.info("Active Directory domain is "+defaultNamingContext);
 
-        con = ClassFactory.createConnection();
-        con.provider("ADsDSOObject");
-        con.open("Active Directory Provider",""/*default*/,""/*default*/,-1/*default*/);
+            con = ClassFactory.createConnection();
+            con.provider("ADsDSOObject");
+            con.open("Active Directory Provider",""/*default*/,""/*default*/,-1/*default*/);
+        } catch (ExecutionException e) {
+            throw new IOException2("Failed to connect to Active Directory. Does this machine belong to Active Directory?",e);
+        }
+    }
+
+    /**
+     * Converts a value of the "distinguished name" attribute of some AD object
+     * and returns the "LDAP://..." URL to connect to it vis {@link IADsOpenDSObject#openDSObject(String, String, String, int)}
+     *
+     * AFAICT, MSDN doesn't document exactly describe how a value of the DN attribute is escaped,
+     * but in my experiment with Windows 2008, it escapes <tt>,+\#<>;"=</tt> but not <tt>/</tt>
+     *
+     * This method must escape '/' since it needs to be escaped in LDAP:// URL, but we also need
+     * to avoid double-escaping what's already escaped.
+     *
+     * @see <a href="http://www.rlmueller.net/CharactersEscaped.htm">source</a>
+     */
+    static String dnToLdapUrl(String dn) {
+        return "LDAP://"+dn.replace("/","\\/");
     }
 
     protected UserDetails retrieveUser(String username, UsernamePasswordAuthenticationToken authentication) throws AuthenticationException {
@@ -74,22 +120,28 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
             IADsUser usr;
             try {
                 usr = (authentication==null
-                    ? dso.openDSObject("LDAP://"+dn, null, null, 0)
-                    : dso.openDSObject("LDAP://"+dn, dn, password, 0))
+                    ? dso.openDSObject(dnToLdapUrl(dn), null, null, ADS_READONLY_SERVER)
+                    : dso.openDSObject(dnToLdapUrl(dn), dn, password, ADS_READONLY_SERVER))
                         .queryInterface(IADsUser.class);
             } catch (ComException e) {
-                throw new BadCredentialsException("Incorrect password for "+username);
+                // this is failing
+                String msg = String.format("Incorrect password for %s DN=%s: error=%08X", username, dn, e.getHRESULT());
+                LOGGER.log(Level.FINE, "Login failure: "+msg,e);
+                throw (BadCredentialsException)new BadCredentialsException(msg).initCause(e);
             }
             if (usr == null)    // the user name was in fact a group
                 throw new UsernameNotFoundException("User not found: "+username);
 
             List<GrantedAuthority> groups = new ArrayList<GrantedAuthority>();
             for( Com4jObject g : usr.groups() ) {
+                if (g==null)        continue;   // according to JENKINS-17357 in some environment the collection contains null
                 IADsGroup grp = g.queryInterface(IADsGroup.class);
                 // cut "CN=" and make that the role name
                 groups.add(new GrantedAuthorityImpl(grp.name().substring(3)));
             }
             groups.add(SecurityRealm.AUTHENTICATED_AUTHORITY);
+
+            LOGGER.log(Level.FINER, "Login successful: "+username+" dn="+dn);
 
             return new ActiveDirectoryUserDetail(
                 username, password,
@@ -189,7 +241,7 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
                 // First get the distinguishedName
                 String dn = getDnOfUserOrGroup(groupname);
                 IADsOpenDSObject dso = COM4J.getObject(IADsOpenDSObject.class, "LDAP:", null);
-                IADsGroup group = dso.openDSObject("LDAP://" + dn, null, null, 0)
+                IADsGroup group = dso.openDSObject(dnToLdapUrl(dn), null, null, ADS_READONLY_SERVER)
                         .queryInterface(IADsGroup.class);
 
                 // If not a group will return null
@@ -209,4 +261,12 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
     };
 
     private static final Logger LOGGER = Logger.getLogger(ActiveDirectoryAuthenticationProvider.class.getName());
+
+    /**
+     * Signify that we can connect to a read-only mirror.
+     *
+     * See http://msdn.microsoft.com/en-us/library/windows/desktop/aa772247(v=vs.85).aspx
+     */
+    private static final int ADS_READONLY_SERVER = 0x4;
+
 }

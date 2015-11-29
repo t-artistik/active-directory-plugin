@@ -1,3 +1,26 @@
+/*
+ * The MIT License
+ *
+ * Copyright (c) 2008-2014, Kohsuke Kawaguchi, CloudBees, Inc., and contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 package hudson.plugins.active_directory;
 
 import hudson.Util;
@@ -5,6 +28,9 @@ import hudson.security.GroupDetails;
 import hudson.security.SecurityRealm;
 import hudson.security.UserMayOrMayNotExistException;
 import hudson.util.Secret;
+import javax.naming.NameNotFoundException;
+
+import hudson.util.TimeUnit2;
 import org.acegisecurity.AuthenticationException;
 import org.acegisecurity.AuthenticationServiceException;
 import org.acegisecurity.BadCredentialsException;
@@ -51,7 +77,9 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
 
     private final String bindName, bindPassword;
 
-    private final ActiveDirectorySecurityRealm.DesciprotrImpl descriptor;
+    private final ActiveDirectorySecurityRealm.DescriptorImpl descriptor;
+
+    private GroupLookupStrategy groupLookupStrategy;
 
     /**
      * {@link ActiveDirectoryGroupDetails} cache.
@@ -118,6 +146,7 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
         this.bindName = realm.bindName;
         this.server = realm.server;
         this.bindPassword = Secret.toString(realm.bindPassword);
+        this.groupLookupStrategy = realm.getGroupLookupStrategy();
         this.descriptor = realm.getDescriptor();
     }
 
@@ -135,7 +164,7 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
                 } catch (UsernameNotFoundException e) {
                     notFound.add(e);
                 } catch (BadCredentialsException bce) {
-                    LOGGER.log(Level.WARNING, "Credential exception tying to authenticate against "+domainName+" domain", bce);
+                    LOGGER.log(Level.WARNING, "Credential exception trying to authenticate against "+domainName+" domain", bce);
                     errors.add(bce);
                 }
             }
@@ -155,14 +184,14 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
             if (!Util.filter(notFound,UserMayOrMayNotExistException.class).isEmpty())
                 // if one domain responds with UserMayOrMayNotExistException, then it might actually exist there,
                 // so our response will be "can't tell"
-                throw new MultiCauseUserNotFoundException("We can't tell if the user exists or not: "+username,notFound);
+                throw new MultiCauseUserMayOrMayNotExistException("We can't tell if the user exists or not: "+username,notFound);
 
             if (!notFound.isEmpty())
                 throw new MultiCauseUserNotFoundException("No such user: "+username,notFound);
 
             throw new AssertionError("no domain is configured");
         } catch (AuthenticationException e) {
-            LOGGER.log(Level.FINE, "Failed toretrieve user "+username, e);
+            LOGGER.log(Level.FINE, "Failed to retrieve user "+username, e);
             throw e;
         }
     }
@@ -218,31 +247,30 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
      */
     public UserDetails retrieveUser(String username, String password, String domainName, List<SocketInfo> ldapServers) {
         DirContext context;
-        String id;
         boolean anonymousBind;    // did we bind anonymously?
 
         // LDAP treats empty password as anonymous bind, so we need to reject it
         if (StringUtils.isEmpty(password))
             throw new BadCredentialsException("Empty password");
-        
+
+        String userPrincipalName = getPrincipalName(username, domainName);
+        String samAccountName = userPrincipalName.substring(0, userPrincipalName.indexOf('@'));
+
         if (bindName!=null) {
             // two step approach. Use a special credential to obtain DN for the
             // user trying to login, then authenticate.
             try {
-                id = username;
                 context = descriptor.bind(bindName, bindPassword, ldapServers);
                 anonymousBind = false;
             } catch (BadCredentialsException e) {
                 throw new AuthenticationServiceException("Failed to bind to LDAP server with the bind name/password", e);
             }
         } else {
-            String principalName = getPrincipalName(username, domainName);
-            id = principalName.substring(0, principalName.indexOf('@'));
             anonymousBind = password == NO_AUTHENTICATION;
             try {
                 // if we are just retrieving the user, try using anonymous bind by empty password (see RFC 2829 5.1)
                 // but if that fails, that's not BadCredentialException but UserMayOrMayNotExistException
-                context = descriptor.bind(principalName, anonymousBind ? "" : password, ldapServers);
+                context = descriptor.bind(userPrincipalName, anonymousBind ? "" : password, ldapServers);
             } catch (BadCredentialsException e) {
                 if (anonymousBind)
                     // in my observation, if we attempt an anonymous bind and AD doesn't allow it, it still passes the bind method
@@ -257,17 +285,11 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
             // locate this user's record
             final String domainDN = toDC(domainName);
 
-            Attributes user = new LDAPSearchBuilder(context,domainDN).subTreeScope().searchOne("(& (userPrincipalName={0})(objectCategory=user))",id);
+            Attributes user = new LDAPSearchBuilder(context,domainDN).subTreeScope().searchOne("(& (sAMAccountName={0})(objectCategory=user))",samAccountName);
             if (user==null) {
-                // failed to find it. Fall back to sAMAccountName.
-                // see http://www.nabble.com/Re%3A-Hudson-AD-plug-in-td21428668.html
-                LOGGER.fine("Failed to find "+id+" in userPrincipalName. Trying sAMAccountName");
-                user = new LDAPSearchBuilder(context,domainDN).subTreeScope().searchOne("(& (sAMAccountName={0})(objectCategory=user))",id);
-                if (user==null) {
-                    throw new UsernameNotFoundException("Authentication was successful but cannot locate the user information for "+username);
-                }
+                throw new UsernameNotFoundException("Authentication was successful but cannot locate the user information for "+username);
             }
-            LOGGER.fine("Found user "+id+" : "+user);
+            LOGGER.fine("Found user "+username+" : "+user);
 
             Object dn = user.get("distinguishedName").get();
             if (dn==null)
@@ -281,7 +303,7 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
                 // Binding alone is not enough to test the credential. Need to actually perform some query operation.
                 // but if the authentication fails this throws an exception
                 try {
-                    new LDAPSearchBuilder(test,domainDN).searchOne("(& (userPrincipalName={0})(objectCategory=user))",id);
+                    new LDAPSearchBuilder(test,domainDN).searchOne("(& (userPrincipalName={0})(objectCategory=user))",userPrincipalName);
                 } finally {
                     closeQuietly(test);
                 }
@@ -290,7 +312,7 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
             Set<GrantedAuthority> groups = resolveGroups(domainDN, dn.toString(), context);
             groups.add(SecurityRealm.AUTHENTICATED_AUTHORITY);
 
-            return new ActiveDirectoryUserDetail(id, password, true, true, true, true, groups.toArray(new GrantedAuthority[groups.size()]),
+            return new ActiveDirectoryUserDetail(username, password, true, true, true, true, groups.toArray(new GrantedAuthority[groups.size()]),
                     getStringAttribute(user, "displayName"),
                     getStringAttribute(user, "mail"),
                     getStringAttribute(user, "telephoneNumber")
@@ -340,7 +362,7 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
      * Returns the full user principal name of the form "joe@europe.contoso.com".
      * 
      * If people type in 'foo@bar' or 'bar\\foo', it should be treated as
-     * 'foo@bar.acme.org'
+     * 'foo@bar.acme.org' (where 'acme.org' part comes from the given domain name)
      */
     private String getPrincipalName(String username, String domainName) {
         String principalName;
@@ -393,6 +415,85 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
         Set<GrantedAuthority> groups = new HashSet<GrantedAuthority>();
 
         NamingEnumeration<SearchResult> renum = new LDAPSearchBuilder(context,domainDN).subTreeScope().returns("cn").search(query.toString(), sids.toArray());
+        parseMembers(userDN, groups, renum);
+        renum.close();
+
+        return groups;
+    }
+
+    /**
+     * Performs AD-extension to LDAP query that performs recursive group lookup.
+     * This Microsoft extension is explained in http://msdn.microsoft.com/en-us/library/aa746475(v=vs.85).aspx
+     *
+     * @return
+     *      false if it appears that this search failed.
+     * @see
+     */
+    private boolean chainGroupLookup(String domainDN, String userDN, DirContext context, Set<GrantedAuthority> groups) throws NamingException {
+        NamingEnumeration<SearchResult> renum = new LDAPSearchBuilder(context, domainDN).subTreeScope().returns("cn").search(
+                "(member:1.2.840.113556.1.4.1941:={0})", userDN);
+        try {
+            if (renum.hasMore()) {
+                // http://ldapwiki.willeke.com/wiki/Active%20Directory%20Group%20Related%20Searches cites that
+                // this filter search extension requires at least Win2K3 SP2. So if this didn't find anything,
+                // fall back to the recursive search
+
+                // TODO: this search alone might be producing the super set of the tokenGroups/objectSid based search in the stage 1.
+                parseMembers(userDN, groups, renum);
+                return true;
+            } else {
+                return false;
+            }
+        } finally {
+            renum.close();
+        }
+    }
+
+    /**
+     * Performs recursive group membership lookup.
+     *
+     * This was how we did the lookup traditionally until we discovered 1.2.840.113556.1.4.1941.
+     * But various people reported that it slows down the execution tremendously to the point that it is unusable,
+     * while others seem to report that it runs faster than recursive search (http://social.technet.microsoft.com/Forums/fr-FR/f238d2b0-a1d7-48e8-8a60-542e7ccfa2e8/recursive-retrieval-of-all-ad-group-memberships-of-a-user?forum=ITCG)
+     *
+     * This implementation is kept for Windows 2003 that doesn't support 1.2.840.113556.1.4.1941, but it can be also
+     * enabled for those who are seeing the performance problem.
+     *
+     * See JENKINS-22830
+     */
+    private void recursiveGroupLookup(DirContext context, Attributes id, Set<GrantedAuthority> groups) throws NamingException {
+        Stack<Attributes> q = new Stack<Attributes>();
+        q.push(id);
+        while (!q.isEmpty()) {
+            Attributes identity = q.pop();
+            LOGGER.finer("Looking up group of " + identity);
+
+            Attribute memberOf = identity.get("memberOf");
+            if (memberOf == null)
+                continue;
+
+            for (int i = 0; i < memberOf.size(); i++) {
+                try {
+                    Attributes group = context.getAttributes(new LdapName(memberOf.get(i).toString()), new String[]{"CN", "memberOf"});
+                    Attribute cn = group.get("CN");
+                    if (cn == null) {
+                        LOGGER.fine("Failed to obtain CN of " + memberOf.get(i));
+                        continue;
+                    }
+                    if (LOGGER.isLoggable(Level.FINE))
+                        LOGGER.fine(cn.get() + " is a member of " + memberOf.get(i));
+
+                    if (groups.add(new GrantedAuthorityImpl(cn.get().toString()))) {
+                        q.add(group); // recursively look for groups that this group is a member of.
+                    }
+                } catch (NameNotFoundException e) {
+                    LOGGER.fine("Failed to obtain CN of " + memberOf.get(i));
+                }
+            }
+        }
+    }
+
+    private void parseMembers(String userDN, Set<GrantedAuthority> groups, NamingEnumeration<SearchResult> renum) throws NamingException {
         while (renum.hasMore()) {
             Attributes a = renum.next().getAttributes();
             Attribute cn = a.get("cn");
@@ -400,42 +501,6 @@ public class ActiveDirectoryUnixAuthenticationProvider extends AbstractActiveDir
                 LOGGER.fine(userDN+" is a member of "+cn);
             groups.add(new GrantedAuthorityImpl(cn.get().toString()));
         }
-        renum.close();
-
-        {/*
-            stage 2: use memberOf to find groups that aren't picked up by tokenGroups.
-            This includes distribution groups
-        */
-            LOGGER.fine("Stage 2: looking up via memberOf");
-
-            Stack<Attributes> q = new Stack<Attributes>();
-            q.push(id);
-            while (!q.isEmpty()) {
-                Attributes identity = q.pop();
-                LOGGER.finer("Looking up group of "+identity);
-
-                Attribute memberOf = identity.get("memberOf");
-                if (memberOf==null)
-                    continue;
-
-                for (int i = 0; i<memberOf.size(); i++) {
-                    Attributes group = context.getAttributes(new LdapName(memberOf.get(i).toString()), new String[] { "CN", "memberOf" });
-                    Attribute cn = group.get("CN");
-                    if (cn==null) {
-                        LOGGER.fine("Failed to obtain CN of "+memberOf.get(i));
-                        continue;
-                    }
-                    if (LOGGER.isLoggable(Level.FINE))
-                        LOGGER.fine(cn.get()+" is a member of "+memberOf.get(i));
-
-                    if (groups.add(new GrantedAuthorityImpl(cn.get().toString()))) {
-                        q.add(group); // recursively look for groups that this group is a member of.
-                    }
-                }
-            }
-        }
-
-        return groups;
     }
 
     /*package*/ static String toDC(String domainName) {
